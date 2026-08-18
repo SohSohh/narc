@@ -9,13 +9,19 @@ services:
       - ${OLLAMA_DATA_DIR:-./ollama-data}:/root/.ollama
     environment:
       - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
-      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+      # 2 so the embedding model (bge-large) and the query-rewrite model
+      # (llama3.2) can both stay resident instead of evicting each other on
+      # every single search request.
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-5m}
       - OLLAMA_HOST=0.0.0.0:11434
     deploy:
       resources:
         limits:
-          memory: 2G
+          # bge-large (~700MB) + llama3.2 3B q4 (~2-3GB) + overhead. Bumped up
+          # since this now runs on a Google Cloud instance rather than a
+          # memory-capped local box -- adjust to whatever the VM actually has.
+          memory: ${OLLAMA_MEMORY_LIMIT:-10G}
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 15s
@@ -24,6 +30,37 @@ services:
       start_period: 60s
     networks:
       - narc
+
+  # One-shot: pulls both models into the ollama-embeddings container over the
+  # network once it's healthy, then exits. Deliberately does NOT touch
+  # ollama-embeddings' own entrypoint/command (that background-script
+  # approach crashed before) -- this just acts as a client hitting the
+  # already-running server via OLLAMA_HOST. Re-running `docker compose up` is
+  # a cheap no-op once both models are already pulled.
+  ollama-model-init:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    container_name: ollama-model-init
+    depends_on:
+      ollama-embeddings:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=ollama-embeddings:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "set -e &&
+       echo 'pulling ${EMBED_MODEL:-bge-large}...' &&
+       ollama pull ${EMBED_MODEL:-bge-large} &&
+       echo 'pulling ${LLM_MODEL:-llama3.2}...' &&
+       ollama pull ${LLM_MODEL:-llama3.2} &&
+       echo 'both models ready'"
+    networks:
+      - narc
+    restart: "no"
+
+  # Reranking is now handled by Cohere's hosted Rerank API (see main.py) --
+  # no local reranker container needed. This avoids the campus-network
+  # interception issue entirely since it's a normal outbound HTTPS call to
+  # api.cohere.com from rag-backend, same as any other API dependency.
 
   rag-backend:
     build:
@@ -35,15 +72,30 @@ services:
       - "${RAG_BACKEND_PORT:-8000}:8000"
     environment:
       - OLLAMA_URL=${OLLAMA_URL:-http://ollama-embeddings:11434}
-      - EMBED_MODEL=${EMBED_MODEL:-bge-large-en-v1.5}
+      - EMBED_MODEL=${EMBED_MODEL:-bge-large}
       - "QUERY_INSTRUCTION_PREFIX=${QUERY_INSTRUCTION_PREFIX:-Represent this sentence for searching relevant passages: }"
+      - LLM_MODEL=${LLM_MODEL:-llama3.2}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-30}
+      - ENABLE_QUERY_REWRITE=${ENABLE_QUERY_REWRITE:-true}
+      # Cap on how many sub-queries a single bundled query (e.g. "admission
+      # requirements and hostel fees") can be split into -- each sub-query
+      # re-runs the whole embed/search/expand/rerank pipeline, so this
+      # bounds worst-case fan-out and Ollama/Qdrant/Cohere load per request.
+      - MAX_SUBQUERIES=${MAX_SUBQUERIES:-4}
       - QDRANT_URL=${QDRANT_URL}
       - QDRANT_API_KEY=${QDRANT_API_KEY}
       - QDRANT_COLLECTION=${QDRANT_COLLECTION:-nust_chunks}
       - EMBED_DIM=${EMBED_DIM:-1024}
+      - ENABLE_RERANK=${ENABLE_RERANK:-true}
+      - COHERE_API_KEY=${COHERE_API_KEY}
+      - COHERE_RERANK_MODEL=${COHERE_RERANK_MODEL:-rerank-v4.0-fast}
+      - RERANK_TOP_N=${RERANK_TOP_N:-10}
+      - RERANK_TIMEOUT=${RERANK_TIMEOUT:-10}
     depends_on:
       ollama-embeddings:
         condition: service_healthy
+      ollama-model-init:
+        condition: service_completed_successfully
     networks:
       - narc
 
