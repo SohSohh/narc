@@ -1,0 +1,53 @@
+services:
+  ollama-embeddings:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    container_name: ollama-embeddings
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ${OLLAMA_DATA_DIR:-./ollama-data}:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-5m}
+      - OLLAMA_HOST=0.0.0.0:11434
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - narc
+
+  rag-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: rag-backend
+    restart: unless-stopped
+    ports:
+      - "${RAG_BACKEND_PORT:-8000}:8000"
+    environment:
+      - OLLAMA_URL=${OLLAMA_URL:-http://ollama-embeddings:11434}
+      - EMBED_MODEL=${EMBED_MODEL:-bge-large-en-v1.5}
+      - "QUERY_INSTRUCTION_PREFIX=${QUERY_INSTRUCTION_PREFIX:-Represent this sentence for searching relevant passages: }"
+      - QDRANT_URL=${QDRANT_URL}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      - QDRANT_COLLECTION=${QDRANT_COLLECTION:-nust_chunks}
+      - EMBED_DIM=${EMBED_DIM:-1024}
+    depends_on:
+      ollama-embeddings:
+        condition: service_healthy
+    networks:
+      - narc
+
+networks:
+  narc:
+    name: ${NETWORK_NAME:-narc}
+    driver: bridge

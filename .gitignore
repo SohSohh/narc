@@ -217,5 +217,12 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-#The scraped data
+#Scraped data and any compressed files
 crawl/output
+*.zip
+
+
+embeddings/
+ollama-data/
+qdrant-data
+
