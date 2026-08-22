@@ -32,7 +32,6 @@ jobs:
           key: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
           port: 22
           source: "docker-compose.yml,backend"
-          target: ${{ secrets.OCI_TARGET_DIR }}
           strip_components: 0
 
       - name: Restart app via SSH
