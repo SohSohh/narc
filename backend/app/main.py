@@ -1,692 +1,74 @@
 """
-rag_backend/main.py
-====================
-FastAPI service that turns a raw, possibly messy, possibly non-English query
-into relevant chunks from Qdrant:
+main.py
+=======
+FastAPI app entrypoint. Wires together:
+  - retrieval.router  -> GET /health, POST /search  (stateless retrieval pipeline)
+  - chat.router        -> POST /chat, DELETE /chat/{session_id}
+                           (stateful conversation on top of retrieval,
+                           via Groq for generation + Redis for history)
 
-    query --> rewrite/translate/split via Ollama (llama3.2)
-          --> one or more clean English sub-queries
-          --> [per sub-query, run concurrently] embed (bge-large)
-                                                  --> Qdrant search
-                                                  --> (optional) neighbor-chunk expansion
-                                                  --> rerank via Cohere Rerank (hosted API)
-          --> merge sub-query results (dedup by chunk_id, best score wins)
-          --> chunks
-
-The rewrite step also splits a query that bundles multiple distinct
-information needs (e.g. "what are the CS admission requirements and is
-there a boys hostel?") into separate sub-queries, each of which is run
-through the full retrieval pipeline independently and the results merged
-back together -- this avoids a single embedding vector having to represent
-two unrelated needs at once, which tends to retrieve chunks that are only
-mediocre matches for either.
-
-Expects:
-  - An Ollama server (the `ollama-embeddings` container from
-    docker-compose.yml) with both the embedding model and llama3.2 pulled.
-  - A Qdrant collection populated by upload_embeddings_to_qdrant.py, with
-    1024-dim cosine vectors and payload containing at least `text`
-    (if uploaded with --chunks) plus chunk_id/title/breadcrumb/source_url.
-  - A Cohere API key (COHERE_API_KEY) for the hosted Rerank endpoint.
-    Previously this stage ran against a self-hosted BGE reranker v2 m3
-    cross-encoder served by HF Text Embeddings Inference, but that
-    container couldn't reliably reach huggingface.co to download its model
-    on the NUST campus network, so reranking was switched to Cohere's
-    hosted API (plain outbound HTTPS, no local model/container needed).
-
-Config (env vars, all optional -- see .env.example):
-  OLLAMA_URL                default: http://ollama-embeddings:11434
-  EMBED_MODEL                default: bge-large
-  QUERY_INSTRUCTION_PREFIX   default: "Represent this sentence for searching relevant passages: "
-  LLM_MODEL                  default: llama3.2
-  LLM_TIMEOUT                default: 30 (seconds, for the rewrite call -- generation is slower than embedding)
-  ENABLE_QUERY_REWRITE       default: true
-  MAX_SUBQUERIES             default: 4 (safety cap on how many sub-queries a single input can be split into --
-                                          each sub-query re-runs the whole embed/search/expand/rerank pipeline,
-                                          so this bounds the worst-case fan-out per request)
-  QDRANT_URL                 default: http://qdrant:6333
-  QDRANT_API_KEY             default: None
-  QDRANT_COLLECTION          default: nust_chunks
-  EMBED_DIM                  default: 1024
-  REQUEST_TIMEOUT            default: 30 (seconds, for the embedding call)
-
-  # Neighbor-chunk expansion (auto-merging / parent-document retrieval, done
-  # against the flat chunk_id/source_url/chunk_index/n_chunks_from_source_text
-  # metadata already in the payload -- no separate parent index needed):
-  ENABLE_CHUNK_EXPANSION      default: true
-  EXPAND_FULL_PAGE_MAX_CHUNKS default: 10 (pages with this many chunks or fewer are pulled in full)
-  EXPAND_WINDOW               default: 2  (chunk_index +/- this many, for longer pages)
-  EXPAND_MAX_CHUNKS_PER_SOURCE default: 20 (safety cap per source_url)
-  EXPAND_MAX_TOTAL_CHUNKS     default: 30 (safety cap on the final merged result count)
-
-  # Reranking (Cohere hosted Rerank API):
-  ENABLE_RERANK       default: true
-  COHERE_API_KEY      default: None (required for reranking to actually run)
-  COHERE_RERANK_MODEL default: rerank-v4.0-fast
-  RERANK_TOP_N        default: 10 (chunks kept after reranking, per request unless overridden)
-  RERANK_TIMEOUT      default: 10 (seconds)
+All actual logic lives in retrieval.py, chat.py, session_store.py, and
+groq_client.py -- this file only owns process lifecycle (shared clients)
+and route registration. See config.py for every env var these modules read.
 """
-
 from __future__ import annotations
 
-import asyncio
-import json
-import os
 import logging
 from contextlib import asynccontextmanager
-from typing import Any
 
 import cohere
 import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
 from qdrant_client import AsyncQdrantClient
-from qdrant_client.http.exceptions import ResponseHandlingException
-from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
+
+from . import chat
+from . import config
+from . import retrieval
+from .session_store import SessionStore
+from .state import clients
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("rag-backend")
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama-embeddings:11434").rstrip("/")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-large")
-# BGE models are trained with an instruction prefix on the QUERY side only
-# (passages/chunks are embedded plain). Skipping this hurts retrieval quality
-# noticeably -- keep it unless you embedded your chunks with a different
-# convention and want symmetry instead.
-QUERY_INSTRUCTION_PREFIX = os.environ.get(
-    "QUERY_INSTRUCTION_PREFIX",
-    "Represent this sentence for searching relevant passages: ",
-)
-
-LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2")
-LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "30"))
-ENABLE_QUERY_REWRITE = os.environ.get("ENABLE_QUERY_REWRITE", "true").strip().lower() in ("1", "true", "yes")
-MAX_SUBQUERIES = int(os.environ.get("MAX_SUBQUERIES", "4"))
-
-QDRANT_URL = os.environ.get("QDRANT_URL", "http://qdrant:6333")
-QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY") or None
-QDRANT_COLLECTION = os.environ.get("QDRANT_COLLECTION", "nust_chunks")
-EMBED_DIM = int(os.environ.get("EMBED_DIM", "1024"))
-REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "30"))
-
-ENABLE_CHUNK_EXPANSION = os.environ.get("ENABLE_CHUNK_EXPANSION", "true").strip().lower() in ("1", "true", "yes")
-EXPAND_FULL_PAGE_MAX_CHUNKS = int(os.environ.get("EXPAND_FULL_PAGE_MAX_CHUNKS", "10"))
-EXPAND_WINDOW = int(os.environ.get("EXPAND_WINDOW", "2"))
-EXPAND_MAX_CHUNKS_PER_SOURCE = int(os.environ.get("EXPAND_MAX_CHUNKS_PER_SOURCE", "20"))
-EXPAND_MAX_TOTAL_CHUNKS = int(os.environ.get("EXPAND_MAX_TOTAL_CHUNKS", "30"))
-
-ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "true").strip().lower() in ("1", "true", "yes")
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
-COHERE_RERANK_MODEL = os.environ.get("COHERE_RERANK_MODEL", "rerank-v4.0-fast")
-RERANK_TOP_N = int(os.environ.get("RERANK_TOP_N", "10"))
-RERANK_TIMEOUT = float(os.environ.get("RERANK_TIMEOUT", "10"))
-
-# The Cohere SDK client is created once at import time (cheap, no network
-# call) and reused across requests, same pattern as the other long-lived
-# clients in this file. None if no key is configured -- rerank_chunks()
-# treats that as "reranking unavailable" and falls back gracefully.
-cohere_client = cohere.AsyncClientV2(api_key=COHERE_API_KEY) if COHERE_API_KEY else None
-
-# ---------------------------------------------------------------------------
-# Query-rewrite + split prompt
-# ---------------------------------------------------------------------------
-# Goal: turn ANY raw input -- any language or script, romanized/transliterated
-# text (Roman Urdu, Hinglish, etc.), mixed-language text, chat-style junk,
-# typos, or an already-clean query -- into one or more clean English
-# sentences optimized for cosine-similarity retrieval against our chunk
-# embeddings. The chunks were embedded from plain English passage text
-# (title/breadcrumb/source_url are metadata alongside, not part of the
-# embedded text), so each rewritten query should read like a natural,
-# information-dense English statement of the need -- not a boolean keyword
-# string, not a question addressed to a chatbot, and not padded with
-# meta-commentary.
-#
-# Splitting: if the raw input bundles multiple DISTINCT information needs
-# (e.g. two unrelated questions joined by "and", or a list of separate
-# asks), a single embedding vector for the whole thing tends to land
-# between both topics and retrieve mediocre matches for either. Instead the
-# model splits such input into separate, independently-searchable
-# sub-queries -- each one gets embedded and searched on its own by the
-# caller, and the chunk results are merged back together afterwards.
-# Queries that only have one information need (the common case) still
-# produce a single-item list, same as before.
-#
-# Structured JSON-only output is used (rather than free text) so a stray
-# preamble like "Sure, here's the rewritten query:" can't leak into what gets
-# embedded -- that preamble text would itself get embedded and pull the
-# vector away from the actual information need.
-
-REWRITE_SYSTEM_PROMPT = """You are a query normalization engine for a semantic search system. Your job is to take a raw user query and turn it into one or more clean, information-dense ENGLISH search queries optimized for embedding-based semantic retrieval. You do not answer questions, hold a conversation, or add commentary.
-
-The input may be:
-- In any language or script (English, Urdu script, Arabic, Chinese, etc.)
-- Romanized/transliterated (Roman Urdu, Hinglish, or similar "type it how it sounds" spellings)
-- A mix of languages or scripts in the same sentence (common code-switching, e.g. English mixed with Roman Urdu)
-- Casual, chat-style text with greetings, filler, disfluencies, typos, or slang
-- A SINGLE information need, or MULTIPLE distinct information needs bundled together (e.g. two unrelated questions joined by "and", separated by a comma, or listed one after another)
-- Already a clean, well-formed English query
-- Empty, gibberish, or carrying no extractable information need
-
-Rules:
-1. Detect the language/script no matter what it is, and produce output ONLY in English. Translate meaning, not literal words -- preserve intent, not phrasing.
-2. Preserve every piece of actual information need: entities, names, numbers, dates, program/course/department names, requirements, comparisons, constraints. Never drop meaningful content.
-3. Strip anything that carries no search-relevant meaning: greetings ("hi", "assalam o alaikum"), filler ("um", "like"), politeness markers ("please", "can you", "kindly", "thanks", "sir", "bhai"), disfluencies, and meta-commentary about wanting an answer ("I was wondering if you could tell me", "just curious").
-4. Do NOT answer the question. Do NOT add facts, assumptions, or specifics that were not present in the original query. Do NOT hallucinate.
-5. Only expand an abbreviation if you are confident of its meaning from context; otherwise leave it as written.
-6. If the query is already a clean, well-formed English search query, return it essentially unchanged -- only remove genuine junk, don't paraphrase for its own sake.
-7. If the input is empty, pure gibberish, or has no extractable information need, return it back verbatim as the single entry in the list (untranslated, unmodified) so the caller can decide how to handle it -- do not invent a query.
-8. Write each result as a natural sentence or noun phrase a person would say when describing what they want to find -- not a list of keywords, not a question starting with "What/How/Can", not addressed to anyone.
-9. SPLITTING: If the input contains two or more DISTINCT information needs (different topics/entities/questions that just happen to be asked together), output one rewritten query per need, each self-contained enough to be searched on its own -- carry over shared context (e.g. "NUST", a program name) into each split-out query rather than leaving it implicit. If the input is really one information need (even if it has several clauses or details), keep it as ONE query -- do not split a single need apart just because it's long or has multiple details. Never produce more than 4 queries; if there are genuinely more than 4 distinct needs, keep the 4 most important and drop the rest.
-10. Output MUST be a single JSON object and NOTHING else -- no markdown, no code fences, no explanation before or after: {"queries": ["...", "..."]}. The list has one entry for a single information need, or multiple entries only when the input truly bundles distinct needs.
-
-Examples:
-
-Input: "hi can u plz tell me what documents are needed for admission in NUST for undergrad programs thanx"
-Output: {"queries": ["documents required for undergraduate admission at NUST"]}
-
-Input: "NUST mein daakhla lenay k liye kitni fees lagti hai and kab tak form submit karna hota hai"
-Output: {"queries": ["NUST admission fee amount and form submission deadline"]}
-
-Input: "مجھے این یو ایس ٹی میں داخلے کے اہلیت کے معیار کے بارے میں بتائیں"
-Output: {"queries": ["NUST admission eligibility criteria"]}
-
-Input: "bhai NUST ka hostel available hai kya for girls, aur uski fees kitni hai"
-Output: {"queries": ["girls hostel availability and fees at NUST"]}
-
-Input: "what are the admission requirements for the CS department, and also is there a boys hostel and how much does it cost"
-Output: {"queries": ["admission requirements for the Computer Science department at NUST", "boys hostel availability and cost at NUST"]}
-
-Input: "NUST scholarship criteria for undergrads, library timings, and how do I contact the registrar's office"
-Output: {"queries": ["NUST undergraduate scholarship eligibility criteria", "NUST library timings", "how to contact the NUST registrar's office"]}
-
-Input: "scholarship"
-Output: {"queries": ["scholarship"]}
-
-Input: "asdkfj random text not a question"
-Output: {"queries": ["asdkfj random text not a question"]}
-
-Input: ""
-Output: {"queries": [""]}
-"""
-
-# ---------------------------------------------------------------------------
-# Lifespan: shared HTTP + Qdrant clients (created once, reused across requests)
-# ---------------------------------------------------------------------------
-
-clients: dict[str, Any] = {}
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    clients["http"] = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
-    clients["qdrant"] = AsyncQdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=REQUEST_TIMEOUT)
-    log.info(f"Ollama:  {OLLAMA_URL} (embed={EMBED_MODEL}, llm={LLM_MODEL}, rewrite_enabled={ENABLE_QUERY_REWRITE})")
-    log.info(f"Qdrant:  {QDRANT_URL} (collection={QDRANT_COLLECTION})")
-    log.info(
-        f"Reranker: Cohere {COHERE_RERANK_MODEL} "
-        f"(enabled={ENABLE_RERANK}, configured={bool(COHERE_API_KEY)}, top_n={RERANK_TOP_N})"
+    clients["http"] = httpx.AsyncClient(timeout=config.REQUEST_TIMEOUT)
+    clients["qdrant"] = AsyncQdrantClient(
+        url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY, timeout=config.REQUEST_TIMEOUT
     )
+    # None if no key configured -- rerank_chunks() treats that as
+    # "reranking unavailable" and falls back gracefully.
+    clients["cohere"] = cohere.AsyncClientV2(api_key=config.COHERE_API_KEY) if config.COHERE_API_KEY else None
+
+    log.info(
+        f"Ollama:  {config.OLLAMA_URL} (embed={config.EMBED_MODEL}, llm={config.LLM_MODEL}, "
+        f"rewrite_enabled={config.ENABLE_QUERY_REWRITE})"
+    )
+    log.info(f"Qdrant:  {config.QDRANT_URL} (collection={config.QDRANT_COLLECTION})")
+    log.info(
+        f"Reranker: Cohere {config.COHERE_RERANK_MODEL} "
+        f"(enabled={config.ENABLE_RERANK}, configured={bool(config.COHERE_API_KEY)}, top_n={config.RERANK_TOP_N})"
+    )
+    log.info(f"Groq: {config.GROQ_MODEL} (configured={bool(config.GROQ_API_KEY)})")
+
+    # Chat is opt-in: if REDIS_URL isn't set, /chat and /chat/{id} stay
+    # mounted but return a 500 explaining why, rather than the whole
+    # service failing to start -- retrieval-only deployments still work.
+    if config.REDIS_URL:
+        chat.session_store = SessionStore(config.REDIS_URL)
+        log.info("Redis: configured -- /chat enabled")
+    else:
+        log.warning("REDIS_URL not set -- /chat is disabled (retrieval-only mode)")
+
     yield
+
     await clients["http"].aclose()
     await clients["qdrant"].close()
+    if chat.session_store is not None:
+        await chat.session_store.close()
 
 
 app = FastAPI(title="narc", lifespan=lifespan)
-
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-
-class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="Natural-language query to search for, any language")
-    top_k: int = Field(5, ge=1, le=100, description="Number of chunks to return")
-    score_threshold: float | None = Field(
-        None, description="Optional minimum cosine similarity score (0-1) to include a result"
-    )
-    filter: dict | None = Field(
-        None, description="Optional raw Qdrant filter dict (e.g. {'must': [...]}), passed through as-is"
-    )
-    skip_rewrite: bool = Field(
-        False, description="If true, embed the raw query as-is and skip the llama3.2 rewrite/split step "
-                            "(the query is always treated as a single query in this case)"
-    )
-    expand_context: bool = Field(
-        True, description="If true, pull in neighboring/whole-page chunks around each vector match "
-                           "so answers that live in a nearby chunk on the same page aren't missed"
-    )
-    rerank: bool = Field(
-        True, description="If true, rerank retrieved chunks with Cohere Rerank "
-                           "before returning -- generally much more precise than cosine similarity alone"
-    )
-    rerank_top_n: int | None = Field(
-        None, description="How many chunks to keep after reranking. Defaults to the RERANK_TOP_N env var. "
-                           "Has no effect if rerank=false."
-    )
-
-
-class Chunk(BaseModel):
-    score: float | None  # None for chunks pulled in via expansion rather than a direct vector match
-    matched: bool = True  # True if this chunk was a direct vector hit, False if pulled in via expansion
-    rerank_score: float | None = None  # cross-encoder relevance score, None if reranking was skipped/failed
-    chunk_id: str | None = None
-    title: str | None = None
-    breadcrumb: str | None = None
-    source_url: str | None = None
-    text: str | None = None
-    payload: dict
-
-
-class SearchResponse(BaseModel):
-    query: str  # original, as received
-    queries: list[str]  # the one or more rewritten sub-queries actually searched (may be [query] unchanged)
-    rewrite_applied: bool
-    results: list[Chunk]  # merged, deduped results across all sub-queries in `queries`
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-async def split_query(text: str) -> tuple[list[str], bool]:
-    """Rewrite/translate a raw query into one or more clean English search
-    queries via llama3.2, splitting it into separate sub-queries if it
-    bundles multiple distinct information needs. Returns (queries, applied).
-    `queries` always has at least one entry. On any failure -- unreachable
-    model, malformed JSON, empty result -- falls back to a single-item list
-    containing the original text with applied=False rather than failing the
-    whole search request."""
-    try:
-        resp = await clients["http"].post(
-            f"{OLLAMA_URL}/api/chat",
-            json={
-                "model": LLM_MODEL,
-                "messages": [
-                    {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
-                ],
-                "format": "json",
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=LLM_TIMEOUT,
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        log.warning(f"Query rewrite failed ({e.response.status_code}: {e.response.text[:200]}) -- using raw query")
-        return [text], False
-    except httpx.RequestError as e:
-        log.warning(f"Query rewrite unreachable ({e}) -- using raw query")
-        return [text], False
-
-    try:
-        content = resp.json()["message"]["content"]
-        parsed = json.loads(content)["queries"]
-        if not isinstance(parsed, list):
-            raise TypeError(f"'queries' was {type(parsed).__name__}, expected list")
-        queries = [q.strip() for q in parsed if isinstance(q, str) and q.strip()]
-    except (KeyError, json.JSONDecodeError, TypeError) as e:
-        log.warning(f"Query rewrite returned unparseable output ({e}) -- using raw query")
-        return [text], False
-
-    if not queries:
-        # Model correctly identified no extractable info need (or returned
-        # an empty list) -- fall back to the raw text rather than embedding
-        # nothing.
-        return [text], False
-
-    if len(queries) > MAX_SUBQUERIES:
-        log.warning(f"Query split into {len(queries)} sub-queries, capping to MAX_SUBQUERIES={MAX_SUBQUERIES}")
-        queries = queries[:MAX_SUBQUERIES]
-
-    return queries, True
-
-
-async def embed_query(text: str) -> list[float]:
-    """Call Ollama's /api/embed to embed a single (already-rewritten) query string."""
-    prompt = f"{QUERY_INSTRUCTION_PREFIX}{text}" if QUERY_INSTRUCTION_PREFIX else text
-    try:
-        resp = await clients["http"].post(
-            f"{OLLAMA_URL}/api/embed",
-            json={"model": EMBED_MODEL, "input": [prompt]},
-        )
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ollama returned {e.response.status_code}: {e.response.text[:300]}",
-        )
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=502, detail=f"Could not reach Ollama at {OLLAMA_URL}: {e}")
-
-    data = resp.json()
-    embeddings = data.get("embeddings")
-    if not embeddings or not embeddings[0]:
-        raise HTTPException(status_code=502, detail=f"Ollama response missing 'embeddings': {data}")
-
-    vector = embeddings[0]
-    if len(vector) != EMBED_DIM:
-        log.warning(f"Embedding dim {len(vector)} != expected {EMBED_DIM} -- check EMBED_MODEL / EMBED_DIM.")
-    return vector
-
-
-async def fetch_chunks_by_source(
-    source_url: str, chunk_indices: list[int] | None, limit: int
-) -> list[Any]:
-    """Fetch chunks belonging to one source_url via Qdrant's scroll API (a
-    payload filter, not a vector search -- no embedding needed for this).
-    If chunk_indices is given, restricts to those indices (windowed
-    expansion); otherwise returns the whole page (full-page expansion)."""
-    conditions = [FieldCondition(key="source_url", match=MatchValue(value=source_url))]
-    if chunk_indices is not None:
-        conditions.append(FieldCondition(key="chunk_index", match=MatchAny(any=chunk_indices)))
-
-    points, _ = await clients["qdrant"].scroll(
-        collection_name=QDRANT_COLLECTION,
-        scroll_filter=Filter(must=conditions),
-        limit=limit,
-        with_payload=True,
-    )
-    return points
-
-
-async def expand_context(hit_points: list[Any]) -> list[dict]:
-    """Auto-merging / parent-document style expansion, implemented directly
-    against the flat source_url / chunk_index / n_chunks_from_source_text
-    metadata already on each chunk (no separate parent index required).
-
-    For each unique source_url among the vector-search hits:
-      - if the page is short (<= EXPAND_FULL_PAGE_MAX_CHUNKS total chunks),
-        pull every chunk on that page -- cheap, and guarantees a nearby fact
-        (e.g. an address a couple chunks away from the matched "About this
-        office" chunk) isn't missed.
-      - otherwise, pull a +/- EXPAND_WINDOW window of chunk_index values
-        around each matched chunk on that page.
-
-    Returns a flat list of dicts (one per chunk, deduped by chunk_id),
-    ordered so chunks from the same source stay grouped and in reading
-    order -- fragmented, out-of-order context otherwise confuses the LLM
-    that eventually consumes this.
-    """
-    # chunk_id -> {"score": float|None, "payload": dict, "matched": bool}
-    merged: dict[str, dict] = {}
-
-    by_source: dict[str, list[Any]] = {}
-    for p in hit_points:
-        payload = p.payload or {}
-        cid = payload.get("chunk_id") or str(p.id)
-        merged[cid] = {"score": p.score, "payload": payload, "matched": True}
-        src = payload.get("source_url")
-        if src:
-            by_source.setdefault(src, []).append(p)
-
-    for source_url, points in by_source.items():
-        sample_payload = points[0].payload or {}
-        total_chunks = sample_payload.get("n_chunks_from_source_text")
-        matched_indices = {
-            pt.payload.get("chunk_index") for pt in points
-            if pt.payload and pt.payload.get("chunk_index") is not None
-        }
-
-        try:
-            if isinstance(total_chunks, int) and total_chunks <= EXPAND_FULL_PAGE_MAX_CHUNKS:
-                extra = await fetch_chunks_by_source(
-                    source_url, chunk_indices=None, limit=min(total_chunks, EXPAND_MAX_CHUNKS_PER_SOURCE)
-                )
-            elif matched_indices:
-                wanted = {
-                    i for idx in matched_indices
-                    for i in range(idx - EXPAND_WINDOW, idx + EXPAND_WINDOW + 1)
-                    if i >= 0
-                }
-                extra = await fetch_chunks_by_source(
-                    source_url, chunk_indices=sorted(wanted), limit=EXPAND_MAX_CHUNKS_PER_SOURCE
-                )
-            else:
-                continue
-        except Exception as e:
-            # Expansion is a best-effort enrichment -- a failure here should
-            # never take down the underlying search results.
-            log.warning(f"Chunk expansion failed for source '{source_url}': {e}")
-            continue
-
-        for ep in extra:
-            payload = ep.payload or {}
-            cid = payload.get("chunk_id") or str(ep.id)
-            if cid not in merged:
-                merged[cid] = {"score": None, "payload": payload, "matched": False}
-
-    # Group by source_url, order groups by their best score (so the
-    # strongest-matching page still leads), and order chunks within a group
-    # by chunk_index so expanded context reads in natural page order.
-    groups: dict[str, list[dict]] = {}
-    for info in merged.values():
-        groups.setdefault(info["payload"].get("source_url", ""), []).append(info)
-
-    ordered_groups = sorted(
-        groups.values(),
-        key=lambda g: max((i["score"] for i in g if i["score"] is not None), default=0.0),
-        reverse=True,
-    )
-
-    ordered: list[dict] = []
-    for group in ordered_groups:
-        group.sort(key=lambda i: (i["payload"].get("chunk_index") is None, i["payload"].get("chunk_index", 0)))
-        ordered.extend(group)
-
-    return ordered[:EXPAND_MAX_TOTAL_CHUNKS]
-
-
-async def rerank_chunks(query: str, chunks: list[dict], top_n: int) -> list[dict]:
-    """Re-score `chunks` against `query` with Cohere's hosted Rerank API
-    (COHERE_RERANK_MODEL, a cross-encoder-style model) and return them in
-    descending relevance order, trimmed to `top_n`.
-
-    Cross-encoder rerankers score a (query, passage) pair jointly, which is
-    far more precise than the cosine similarity used for the initial vector
-    search -- but it's also too slow to run over the whole collection, hence
-    doing it as a second pass over just the candidates. Chunks with no
-    `text` in their payload can't be scored and are left out of the
-    reranked set entirely (there's nothing to rank). On any failure -- no
-    API key configured, network error, bad response -- falls back to the
-    original (vector-search / expansion) order rather than failing the
-    whole request. (Previously this called a self-hosted BGE reranker v2 m3
-    cross-encoder over HTTP; switched to Cohere's hosted API since the
-    self-hosted model couldn't reliably download on the NUST campus
-    network -- see HANDOFF.md.)"""
-    if not cohere_client:
-        log.warning("COHERE_API_KEY not configured -- skipping rerank, keeping original order")
-        return chunks[:top_n]
-
-    indexed = [(i, c) for i, c in enumerate(chunks) if c["payload"].get("text")]
-    if not indexed:
-        return chunks[:top_n]
-
-    texts = [c["payload"]["text"] for _, c in indexed]
-    try:
-        response = await cohere_client.rerank(
-            model=COHERE_RERANK_MODEL,
-            query=query,
-            documents=texts,
-            top_n=min(top_n, len(texts)),
-            request_options={"timeout_in_seconds": RERANK_TIMEOUT},
-        )
-    except Exception as e:
-        # Cohere's SDK raises its own exception types (ApiError, etc.)
-        # rather than httpx's, so this is caught broadly on purpose --
-        # any failure here should degrade to the original order, not
-        # take down the request.
-        log.warning(f"Cohere rerank failed ({e}) -- keeping original order")
-        return chunks[:top_n]
-
-    reordered = []
-    for r in response.results:  # already sorted by relevance_score descending
-        _, chunk = indexed[r.index]
-        reordered.append({**chunk, "rerank_score": r.relevance_score})
-
-    return reordered
-
-
-async def run_single_query_pipeline(query_text: str, req: SearchRequest) -> list[dict]:
-    """Run the embed --> Qdrant search --> (optional) expansion --> (optional)
-    rerank pipeline for a single already-rewritten sub-query string.
-    Reranking, when enabled, scores chunks against this specific sub-query
-    text -- not some blended multi-topic string -- which is why each
-    sub-query gets its own full pipeline run rather than merging candidates
-    before reranking. Returns a list of chunk dicts (the same
-    score/payload/matched[/rerank_score] shape used by expand_context and
-    rerank_chunks)."""
-    vector = await embed_query(query_text)
-
-    try:
-        hits = await clients["qdrant"].query_points(
-            collection_name=QDRANT_COLLECTION,
-            query=vector,
-            limit=req.top_k,
-            score_threshold=req.score_threshold,
-            query_filter=req.filter,
-            with_payload=True,
-        )
-    except ResponseHandlingException as e:
-        raise HTTPException(status_code=502, detail=f"Qdrant query failed: {e}")
-
-    if ENABLE_CHUNK_EXPANSION and req.expand_context:
-        merged = await expand_context(hits.points)
-    else:
-        merged = [
-            {"score": p.score, "payload": p.payload or {}, "matched": True}
-            for p in hits.points
-        ]
-
-    if ENABLE_RERANK and req.rerank:
-        merged = await rerank_chunks(query_text, merged, req.rerank_top_n or RERANK_TOP_N)
-
-    return merged
-
-
-def merge_subquery_results(results_per_query: list[list[dict]]) -> list[dict]:
-    """Merge the chunk-dict lists produced by running each sub-query through
-    run_single_query_pipeline() into one combined, deduped list -- this is
-    the "send the chunks together" step for a query that got split into
-    several sub-queries.
-
-    A chunk pulled in by more than one sub-query (e.g. two sub-queries about
-    the same NUST department landing on the same page) is merged into a
-    single entry: `matched` is True if any sub-query matched it directly
-    (rather than via expansion), and `score`/`rerank_score` keep the best
-    (highest) value seen across sub-queries, so a chunk that scored well for
-    one sub-query isn't dragged down by a weaker score from another.
-
-    Final order is by rerank_score descending (chunks with no rerank_score
-    sort after ones that have it), then by score descending, so the
-    strongest matches lead regardless of which sub-query surfaced them.
-    """
-    merged: dict[str, dict] = {}
-    for chunk_list in results_per_query:
-        for item in chunk_list:
-            payload = item["payload"]
-            cid = payload.get("chunk_id") or f"{payload.get('source_url')}::{payload.get('chunk_index')}"
-            existing = merged.get(cid)
-            if existing is None:
-                merged[cid] = dict(item)
-                continue
-
-            existing["matched"] = existing["matched"] or item["matched"]
-            if item.get("score") is not None and (
-                existing.get("score") is None or item["score"] > existing["score"]
-            ):
-                existing["score"] = item["score"]
-            if item.get("rerank_score") is not None and (
-                existing.get("rerank_score") is None or item["rerank_score"] > existing["rerank_score"]
-            ):
-                existing["rerank_score"] = item["rerank_score"]
-
-    def sort_key(item: dict) -> tuple:
-        rr, sc = item.get("rerank_score"), item.get("score")
-        return (rr is not None, rr if rr is not None else float("-inf"),
-                sc is not None, sc if sc is not None else float("-inf"))
-
-    return sorted(merged.values(), key=sort_key, reverse=True)
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-@app.get("/health")
-async def health():
-    status = {"ollama": "unknown", "qdrant": "unknown", "reranker": "unknown"}
-    try:
-        r = await clients["http"].get(f"{OLLAMA_URL}/api/tags")
-        if r.status_code == 200:
-            tags = {m["name"].split(":")[0] for m in r.json().get("models", [])}
-            missing = [m for m in (EMBED_MODEL, LLM_MODEL) if m.split(":")[0] not in tags]
-            status["ollama"] = "ok" if not missing else f"reachable but missing model(s): {missing}"
-        else:
-            status["ollama"] = f"error ({r.status_code})"
-    except Exception as e:
-        status["ollama"] = f"unreachable ({e})"
-
-    try:
-        ok = await clients["qdrant"].collection_exists(QDRANT_COLLECTION)
-        status["qdrant"] = "ok" if ok else f"collection '{QDRANT_COLLECTION}' not found"
-    except Exception as e:
-        status["qdrant"] = f"unreachable ({e})"
-
-    # Cohere's Rerank API has no cheap unauthenticated health-check endpoint
-    # worth calling on every /health hit, so this just confirms a key is
-    # configured rather than round-tripping to api.cohere.com. An invalid
-    # key would still surface at request time via rerank_chunks()'s
-    # fallback-to-original-order path.
-    status["reranker"] = "ok" if COHERE_API_KEY else "COHERE_API_KEY not configured"
-    if not ENABLE_RERANK:
-        status["reranker"] += " (disabled via ENABLE_RERANK)"
-
-    healthy = status["ollama"] == "ok" and status["qdrant"] == "ok" and (
-        not ENABLE_RERANK or status["reranker"].startswith("ok")
-    )
-    return {"healthy": healthy, **status}
-
-
-@app.post("/search", response_model=SearchResponse)
-async def search(req: SearchRequest):
-    if ENABLE_QUERY_REWRITE and not req.skip_rewrite:
-        queries, applied = await split_query(req.query)
-    else:
-        queries, applied = [req.query], False
-
-    # Each sub-query runs the full embed/search/expand/rerank pipeline
-    # independently (and concurrently) -- see run_single_query_pipeline --
-    # then the per-sub-query chunk lists are merged and deduped below so a
-    # bundled multi-part question comes back as one combined result set.
-    results_per_query = await asyncio.gather(
-        *(run_single_query_pipeline(q, req) for q in queries)
-    )
-    merged = merge_subquery_results(list(results_per_query))
-
-    results = []
-    for item in merged:
-        payload = item["payload"]
-        results.append(
-            Chunk(
-                score=item["score"],
-                matched=item["matched"],
-                rerank_score=item.get("rerank_score"),
-                chunk_id=payload.get("chunk_id"),
-                title=payload.get("title"),
-                breadcrumb=payload.get("breadcrumb"),
-                source_url=payload.get("source_url"),
-                text=payload.get("text"),
-                payload=payload,
-            )
-        )
-
-    return SearchResponse(
-        query=req.query,
-        queries=queries,
-        rewrite_applied=applied,
-        results=results,
-    )
+app.include_router(retrieval.router)
+app.include_router(chat.router)

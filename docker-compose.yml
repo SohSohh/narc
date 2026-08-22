@@ -91,6 +91,9 @@ services:
       - COHERE_RERANK_MODEL=${COHERE_RERANK_MODEL:-rerank-v4.0-fast}
       - RERANK_TOP_N=${RERANK_TOP_N:-10}
       - RERANK_TIMEOUT=${RERANK_TIMEOUT:-10}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-openai/gpt-oss-120b}
+      - REDIS_URL=${REDIS_URL}
     depends_on:
       ollama-embeddings:
         condition: service_healthy

@@ -225,4 +225,4 @@ crawl/output
 embeddings/
 ollama-data/
 qdrant-data
-
+OCI-data/
