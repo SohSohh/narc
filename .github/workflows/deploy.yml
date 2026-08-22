@@ -12,7 +12,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2   # need previous commit to diff against
+          fetch-depth: 2
 
       - name: Detect backend changes
         uses: dorny/paths-filter@v3
@@ -24,7 +24,7 @@ jobs:
               - 'docker-compose.yml'
 
       - name: Copy files to OCI via SCP
-        if: steps.filter.outputs.backend == 'true'
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.OCI_HOST }}
@@ -32,10 +32,11 @@ jobs:
           key: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
           port: 22
           source: "docker-compose.yml,backend"
+          target: "/home/opc"
           strip_components: 0
 
       - name: Restart app via SSH
-        if: steps.filter.outputs.backend == 'true'
+        if: steps.filter.outputs.backend == 'true' || github.event_name == 'workflow_dispatch'
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.OCI_HOST }}
@@ -43,5 +44,6 @@ jobs:
           key: ${{ secrets.OCI_SSH_PRIVATE_KEY }}
           script: |
             set -e
+            cd /home/opc
             docker compose build rag-backend
             docker compose up -d
