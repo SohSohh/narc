@@ -7,18 +7,26 @@ resolution via the existing llama3.2 rewrite step + retrieval.run_search()
 + answer generation via Groq (groq_client.py).
 
 Flow per request:
-  1. Load this session's history from Redis (empty list for a new session).
-  2. Resolve the raw message against a short slice of recent history by
+  1. Resolve the session id: prefer the HttpOnly cookie the browser sends
+     automatically; fall back to session_id in the request body (for non-
+     browser callers); otherwise mint a new one. An unrecognized/expired
+     id isn't rejected -- it's just treated as a fresh session with empty
+     history, since Redis is the real source of truth on validity.
+  2. Load this session's history from Redis (empty list for a new session).
+  3. Resolve the raw message against a short slice of recent history by
      feeding both into the existing split_query() rewrite step, so
      "what about that?" becomes a standalone, embeddable query. Only
      REWRITE_CONTEXT_MESSAGES worth of history is used here -- resolving a
      reference never needs the whole conversation, just the last exchange
      or two.
-  3. Run the resolved query through the normal retrieval pipeline
+  4. Run the resolved query through the normal retrieval pipeline
      (retrieval.run_search) -- unchanged, no chat-specific special-casing.
-  4. Generate the final answer with Groq, given the full kept history +
+  5. Generate the final answer with Groq, given the full kept history +
      the retrieved chunks + the new message.
-  5. Persist the new user/assistant turn to Redis (sliding TTL) and return.
+  6. Persist the new user/assistant turn to Redis (sliding TTL), set/refresh
+     the session cookie, and return -- including how many seconds are left
+     before the session expires, so the frontend can show/reset a countdown
+     without needing to read the (HttpOnly, JS-inaccessible) cookie itself.
 
 Kept as a separate module/router from retrieval.py on purpose: retrieval
 stays a stateless, independently reusable service (e.g. a future non-chat
@@ -30,7 +38,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from . import config
@@ -57,8 +65,9 @@ direct. When useful, mention which page/source the information came from.\
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="The user's chat message")
     session_id: str | None = Field(
-        None, description="Existing session to continue. Omit to start a new session "
-                           "(the response returns the newly created session_id)."
+        None, description="Fallback session id for non-browser callers that can't rely on "
+                           "cookies. Browsers should omit this -- the session cookie set on "
+                           "the previous response is used automatically instead."
     )
 
 
@@ -67,6 +76,7 @@ class ChatResponse(BaseModel):
     answer: str
     resolved_query: str  # what was actually searched, after reference resolution
     sources: list[Chunk]
+    expires_in_seconds: int  # time left on this session before Redis expires it; resets every turn
 
 
 def _format_context_block(chunks: list[Chunk]) -> str:
@@ -98,11 +108,15 @@ async def _resolve_query(message: str, history: list[dict[str, str]]) -> str:
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request, response: Response):
     if session_store is None:
         raise HTTPException(status_code=500, detail="Chat is unavailable: REDIS_URL is not configured")
 
-    session_id = req.session_id or str(uuid.uuid4())
+    # Cookie wins if present (the normal browser path); req.session_id is
+    # only there for non-browser callers. Either way, an id Redis doesn't
+    # recognize (new, or expired) just resolves to empty history below --
+    # no separate "is this valid" check needed.
+    session_id = request.cookies.get(config.SESSION_COOKIE_NAME) or req.session_id or str(uuid.uuid4())
     history = await session_store.get_history(session_id)
 
     contextualized = await _resolve_query(req.message, history)
@@ -126,17 +140,34 @@ async def chat(req: ChatRequest):
     # it can be reused as-is for future reference resolution.
     await session_store.append_turn(session_id, req.message, answer)
 
+    # append_turn() refreshes the Redis key's TTL to the full
+    # SESSION_TTL_SECONDS on every successful write, so that constant IS
+    # the remaining lifetime right now -- no separate Redis TTL lookup
+    # needed. (If the Redis write silently failed -- session_store logs and
+    # swallows that -- this value would be slightly optimistic for that one
+    # turn; harmless, since the next successful turn corrects it.)
+    response.set_cookie(
+        key=config.SESSION_COOKIE_NAME,
+        value=session_id,
+        max_age=config.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=config.COOKIE_SECURE,
+        samesite=config.COOKIE_SAMESITE,
+    )
+
     return ChatResponse(
         session_id=session_id,
         answer=answer,
         resolved_query=resolved_query,
         sources=search_result.results[: config.ANSWER_CONTEXT_CHUNKS],
+        expires_in_seconds=config.SESSION_TTL_SECONDS,
     )
 
 
 @router.delete("/chat/{session_id}")
-async def clear_session(session_id: str):
+async def clear_session(session_id: str, response: Response):
     if session_store is None:
         raise HTTPException(status_code=500, detail="Chat is unavailable: REDIS_URL is not configured")
     await session_store.clear(session_id)
+    response.delete_cookie(config.SESSION_COOKIE_NAME)
     return {"cleared": session_id}

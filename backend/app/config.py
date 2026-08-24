@@ -70,3 +70,28 @@ MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "20"))  # 10 u
 REWRITE_CONTEXT_MESSAGES = int(os.environ.get("REWRITE_CONTEXT_MESSAGES", "4"))
 # How many retrieved chunks get put in the Groq answer-generation prompt.
 ANSWER_CONTEXT_CHUNKS = int(os.environ.get("ANSWER_CONTEXT_CHUNKS", "8"))
+
+# --- Chat session cookie ---
+# The browser carries the session id in an HttpOnly cookie instead of the
+# frontend having to track and resend it -- see chat.py. Cookie lifetime
+# mirrors SESSION_TTL_SECONDS; the cookie itself is just a carrier, Redis's
+# own TTL on the session key remains the actual source of truth for whether
+# a session is still valid.
+SESSION_COOKIE_NAME = os.environ.get("SESSION_COOKIE_NAME", "session_id")
+# Must be true in production (cookie only sent over HTTPS, which is what
+# the OCI API Gateway terminates as anyway). Only turn this off for local
+# http:// development.
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "true").strip().lower() in ("1", "true", "yes")
+# "none" is required if the frontend is served from a different origin than
+# the API Gateway hostname (the common case here, since we're not fronting
+# the gateway with a custom domain) -- browsers refuse to send SameSite=Lax
+# or Strict cookies cross-site. "none" requires COOKIE_SECURE=true.
+COOKIE_SAMESITE = os.environ.get("COOKIE_SAMESITE", "none")
+
+# --- CORS ---
+# Required for the browser to (a) allow the frontend's JS to call this API
+# cross-origin at all, and (b) actually attach/accept the session cookie --
+# allow_credentials=True on the CORS middleware only works with an explicit
+# origin, never "*". Comma-separate multiple origins (e.g. local dev +
+# prod) if needed.
+FRONTEND_ORIGINS = [o.strip() for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()]
