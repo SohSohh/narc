@@ -52,14 +52,6 @@ async def lifespan(app: FastAPI):
         f"(enabled={config.ENABLE_RERANK}, configured={bool(config.COHERE_API_KEY)}, top_n={config.RERANK_TOP_N})"
     )
     log.info(f"Groq: {config.GROQ_MODEL} (configured={bool(config.GROQ_API_KEY)})")
-    if config.FRONTEND_ORIGINS:
-        log.info(f"CORS: allowing {config.FRONTEND_ORIGINS} (credentials enabled -- session cookie will work)")
-    else:
-        log.warning(
-            "FRONTEND_ORIGINS not set -- CORS is disabled. Cross-origin browser requests will be "
-            "blocked, and the session cookie won't be sent/accepted even same-origin fetches that "
-            "omit it. Set FRONTEND_ORIGINS to your frontend's origin(s) before going live."
-        )
 
     # Chat is opt-in: if REDIS_URL isn't set, /chat and /chat/{id} stay
     # mounted but return a 500 explaining why, rather than the whole
@@ -79,20 +71,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="narc", lifespan=lifespan)
-
-# allow_credentials=True is required for the browser to send/accept the
-# HttpOnly session cookie cross-origin -- but per the CORS spec that only
-# works with explicit origin(s), never "*". If FRONTEND_ORIGINS is empty,
-# CORSMiddleware is skipped entirely (see the startup warning above) rather
-# than falling back to a wildcard that would silently break cookies anyway.
-if config.FRONTEND_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=config.FRONTEND_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-    )
-
+# Open CORS -- fine for a prototype/testing frontend hitting this from
+# anywhere (including a sandboxed browser artifact with an unpredictable
+# origin), but tighten this to your actual frontend's domain before this
+# is anything other than a test deployment.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(retrieval.router)
 app.include_router(chat.router)

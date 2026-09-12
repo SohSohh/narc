@@ -1,0 +1,247 @@
+id: /subscriptions/9a93a1be-75a6-41ac-b0ab-2eeefb983668/resourceGroups/narc-rg/providers/Microsoft.App/containerapps/ollama-embeddings
+identity:
+  type: None
+location: UAE North
+name: ollama-embeddings
+properties:
+  configuration:
+    activeRevisionsMode: Single
+    dapr: null
+    identitySettings: []
+    ingress:
+      additionalPortMappings: null
+      allowInsecure: false
+      clientCertificateMode: null
+      corsPolicy: null
+      customDomains: null
+      exposedPort: 0
+      external: false
+      fqdn: ollama-embeddings.internal.orangeglacier-b4beb8b5.uaenorth.azurecontainerapps.io
+      ipSecurityRestrictions: null
+      stickySessions: null
+      targetPort: 11434
+      traffic:
+        - latestRevision: true
+          weight: 100
+      transport: Auto
+    maxInactiveRevisions: 100
+    registries: null
+    runtime: null
+    secrets: null
+    service: null
+  customDomainVerificationId: D565C40596F316EB1DC68D8E990F3E28B4418548787BF0D20B19E8D2380E890F
+  delegatedIdentities: []
+  environmentId: /subscriptions/9a93a1be-75a6-41ac-b0ab-2eeefb983668/resourceGroups/narc-rg/providers/Microsoft.App/managedEnvironments/narc-env
+  eventStreamEndpoint: https://uaenorth.azurecontainerapps.dev/subscriptions/9a93a1be-75a6-41ac-b0ab-2eeefb983668/resourceGroups/narc-rg/containerApps/ollama-embeddings/eventstream
+  latestReadyRevisionName: ollama-embeddings--n8w9p68
+  latestRevisionFqdn: ollama-embeddings--n8w9p68.internal.orangeglacier-b4beb8b5.uaenorth.azurecontainerapps.io
+  latestRevisionName: ollama-embeddings--n8w9p68
+  managedEnvironmentId: /subscriptions/9a93a1be-75a6-41ac-b0ab-2eeefb983668/resourceGroups/narc-rg/providers/Microsoft.App/managedEnvironments/narc-env
+  outboundIpAddresses:
+    - 20.233.94.65
+    - 20.233.94.43
+    - 20.233.94.56
+    - 20.233.94.22
+    - 20.174.42.59
+    - 20.174.42.170
+    - 20.174.41.65
+    - 20.174.40.223
+    - 20.174.40.63
+    - 20.174.41.166
+    - 74.162.164.13
+    - 74.162.182.235
+    - 20.233.170.154
+    - 20.174.116.221
+    - 20.174.116.21
+    - 20.233.123.213
+    - 20.233.202.240
+    - 20.233.170.36
+    - 20.174.109.155
+    - 20.233.124.14
+    - 20.174.113.107
+    - 20.233.124.81
+    - 20.174.109.137
+    - 20.233.120.84
+    - 20.233.202.128
+    - 20.233.203.0
+    - 74.162.163.234
+    - 20.233.80.166
+    - 74.162.106.245
+    - 20.233.145.204
+    - 74.162.164.176
+    - 74.162.107.141
+    - 74.162.107.140
+    - 20.174.109.104
+    - 20.233.145.244
+    - 20.233.171.2
+    - 74.162.163.238
+    - 20.174.114.242
+    - 20.233.144.142
+    - 74.162.108.118
+    - 20.233.203.162
+    - 20.174.116.174
+    - 20.233.120.85
+    - 74.162.182.229
+    - 20.233.145.243
+    - 20.233.189.16
+    - 20.174.116.165
+    - 20.233.189.18
+    - 20.174.109.130
+    - 20.233.203.154
+    - 74.162.164.12
+    - 20.174.109.99
+    - 20.174.116.192
+    - 74.162.108.122
+    - 20.233.188.135
+    - 20.233.144.55
+    - 20.233.145.72
+    - 74.162.183.92
+    - 20.174.115.70
+    - 20.233.145.1
+    - 20.233.203.142
+    - 74.162.182.234
+    - 20.233.203.137
+    - 74.162.107.171
+    - 20.174.114.203
+    - 20.233.203.122
+    - 74.162.163.239
+    - 20.174.109.96
+    - 20.233.80.167
+    - 20.233.189.17
+    - 20.233.83.20
+    - 20.233.144.14
+    - 20.174.116.159
+    - 20.233.177.1
+    - 20.233.146.26
+    - 20.174.109.142
+    - 74.162.164.72
+    - 74.162.182.228
+    - 20.233.124.166
+    - 20.174.109.148
+    - 20.203.70.37
+    - 20.233.87.121
+    - 20.233.87.215
+    - 20.233.112.232
+    - 20.233.247.161
+    - 20.233.192.155
+    - 20.233.192.152
+    - 20.233.192.184
+    - 20.233.192.128
+    - 20.233.245.171
+    - 74.162.138.97
+    - 74.162.183.93
+    - 20.233.159.120
+    - 74.162.108.157
+    - 20.233.238.137
+    - 20.233.88.30
+    - 20.233.234.210
+    - 74.162.195.213
+    - 20.233.157.47
+    - 20.233.175.147
+    - 20.233.88.232
+    - 74.162.137.73
+    - 20.233.237.2
+    - 20.233.173.64
+    - 20.233.175.56
+    - 20.233.204.48
+    - 74.162.203.25
+    - 20.233.175.17
+    - 20.233.141.34
+    - 20.174.109.208
+    - 20.203.73.253
+    - 20.233.88.228
+    - 20.233.238.78
+    - 20.233.146.233
+    - 20.233.238.57
+    - 20.233.238.54
+    - 20.233.237.79
+    - 20.174.109.188
+    - 20.233.173.166
+    - 20.233.159.201
+    - 20.233.189.19
+    - 20.233.236.176
+    - 20.233.88.233
+    - 74.162.202.138
+    - 20.233.146.209
+    - 20.233.173.96
+    - 74.162.202.95
+    - 20.233.88.20
+    - 74.162.146.103
+    - 20.233.88.229
+    - 74.162.137.72
+    - 20.233.175.116
+    - 74.162.182.189
+    - 74.162.189.24
+    - 74.162.196.186
+    - 20.233.146.188
+    - 20.233.88.239
+    - 74.162.197.199
+    - 74.162.163.162
+    - 20.203.75.106
+    - 20.203.73.59
+    - 20.233.88.238
+    - 74.162.183.88
+    - 74.162.146.36
+    - 20.233.146.221
+    - 74.162.202.41
+    - 20.233.93.57
+    - 20.233.173.28
+    - 74.162.146.102
+    - 20.233.175.139
+    - 40.120.117.47
+    - 20.233.175.72
+    - 20.233.204.1
+    - 74.162.108.123
+    - 74.162.183.89
+    - 20.233.175.156
+    - 74.162.202.160
+    - 74.162.179.240
+    - 74.162.108.75
+    - 74.162.137.74
+    - 20.233.94.148
+  provisioningState: Succeeded
+  runningStatus: Running
+  template:
+    containers:
+      - env:
+          - name: OLLAMA_NUM_PARALLEL
+            value: '4'
+          - name: OLLAMA_MAX_LOADED_MODELS
+            value: '2'
+          - name: OLLAMA_KEEP_ALIVE
+            value: 5m
+          - name: OLLAMA_HOST
+            value: 0.0.0.0:11434
+        image: ollama/ollama:latest
+        name: ollama-embeddings
+        volumeMounts:
+          - volumeName: ollama-data
+            mountPath: /root/.ollama
+        resources:
+          cpu: 4.0
+          ephemeralStorage: 8Gi
+          memory: 8Gi
+    initContainers: null
+    revisionSuffix: ''
+    scale:
+      cooldownPeriod: 300
+      maxReplicas: 1
+      minReplicas: 1
+      pollingInterval: 30
+      rules: null
+    serviceBinds: null
+    terminationGracePeriodSeconds: null
+    volumes:
+      - name: ollama-data
+        storageName: ollama-storage
+        storageType: AzureFile
+  workloadProfileName: Consumption
+resourceGroup: narc-rg
+systemData:
+  createdAt: '2026-08-31T10:00:19.0489563'
+  createdBy: sohaibmubashir6@gmail.com
+  createdByType: User
+  lastModifiedAt: '2026-08-31T10:00:19.0489563'
+  lastModifiedBy: sohaibmubashir6@gmail.com
+  lastModifiedByType: User
+type: Microsoft.App/containerApps

@@ -1,0 +1,16 @@
+containers:
+- name: ollama-model-init
+  image: ollama/ollama:latest
+  command:
+  - /bin/sh
+  args:
+  - -c
+  - ollama pull bge-large && ollama pull llama3.2 && echo "both models ready"
+  env:
+  - name: OLLAMA_HOST
+    value: https://ollama-embeddings.internal.orangeglacier-b4beb8b5.uaenorth.azurecontainerapps.io
+  resources:
+    cpu: 1.0
+    memory: 2.0Gi
+initContainers: null
+volumes: null
