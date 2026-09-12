@@ -55,8 +55,11 @@ async def generate_answer(system_prompt: str, messages: list[dict[str, str]]) ->
         log.error(f"Groq unreachable: {e}")
         raise HTTPException(status_code=502, detail=f"Could not reach Groq: {e}")
 
-    data = resp.json()
     try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as e:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("empty answer content")
+        return content
+    except (KeyError, IndexError, TypeError, ValueError) as e:
         raise HTTPException(status_code=502, detail=f"Malformed Groq response: {e}")

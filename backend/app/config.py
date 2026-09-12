@@ -69,7 +69,7 @@ MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "20"))  # 10 u
 # exchange or two is ever needed to resolve a reference.
 REWRITE_CONTEXT_MESSAGES = int(os.environ.get("REWRITE_CONTEXT_MESSAGES", "4"))
 # How many retrieved chunks get put in the Groq answer-generation prompt.
-ANSWER_CONTEXT_CHUNKS = int(os.environ.get("ANSWER_CONTEXT_CHUNKS", "8"))
+ANSWER_CONTEXT_CHUNKS = int(os.environ.get("ANSWER_CONTEXT_CHUNKS", "12"))
 
 # --- Chat session cookie ---
 # The browser carries the session id in an HttpOnly cookie instead of the
@@ -95,3 +95,5 @@ COOKIE_SAMESITE = os.environ.get("COOKIE_SAMESITE", "none")
 # origin, never "*". Comma-separate multiple origins (e.g. local dev +
 # prod) if needed.
 FRONTEND_ORIGINS = [o.strip() for o in os.environ.get("FRONTEND_ORIGINS", "").split(",") if o.strip()]
+# Bound reference text sent to generation while allowing more short passages.
+ANSWER_CONTEXT_MAX_CHARS = max(1, int(os.environ.get("ANSWER_CONTEXT_MAX_CHARS", "24000")))

@@ -311,7 +311,9 @@ async def expand_context(hit_points: list[Any]) -> list[dict]:
         if src:
             by_source.setdefault(src, []).append(p)
 
-    for source_url, points in by_source.items():
+    semaphore = asyncio.Semaphore(6)
+
+    async def fetch_source(source_url, points):
         sample_payload = points[0].payload or {}
         total_chunks = sample_payload.get("n_chunks_from_source_text")
         matched_indices = {
@@ -321,7 +323,7 @@ async def expand_context(hit_points: list[Any]) -> list[dict]:
 
         try:
             if isinstance(total_chunks, int) and total_chunks <= config.EXPAND_FULL_PAGE_MAX_CHUNKS:
-                extra = await fetch_chunks_by_source(
+                extra = await limited_fetch(
                     source_url, chunk_indices=None, limit=min(total_chunks, config.EXPAND_MAX_CHUNKS_PER_SOURCE)
                 )
             elif matched_indices:
@@ -330,17 +332,25 @@ async def expand_context(hit_points: list[Any]) -> list[dict]:
                     for i in range(idx - config.EXPAND_WINDOW, idx + config.EXPAND_WINDOW + 1)
                     if i >= 0
                 }
-                extra = await fetch_chunks_by_source(
+                extra = await limited_fetch(
                     source_url, chunk_indices=sorted(wanted), limit=config.EXPAND_MAX_CHUNKS_PER_SOURCE
                 )
             else:
-                continue
+                return []
         except Exception as e:
             # Expansion is a best-effort enrichment -- a failure here should
             # never take down the underlying search results.
             log.warning(f"Chunk expansion failed for source '{source_url}': {e}")
-            continue
+            return []
 
+        return extra
+
+    async def limited_fetch(*args, **kwargs):
+        async with semaphore:
+            return await fetch_chunks_by_source(*args, **kwargs)
+
+    extras = await asyncio.gather(*(fetch_source(src, points) for src, points in by_source.items()))
+    for extra in extras:
         for ep in extra:
             payload = ep.payload or {}
             cid = payload.get("chunk_id") or str(ep.id)
@@ -498,14 +508,16 @@ def merge_subquery_results(results_per_query: list[list[dict]]) -> list[dict]:
     return sorted(merged.values(), key=sort_key, reverse=True)
 
 
-async def run_search(req: SearchRequest) -> SearchResponse:
+async def run_search(req: SearchRequest, *, fallback_query: str | None = None) -> SearchResponse:
     """The actual retrieval pipeline entrypoint, factored out of the
     /search route so chat.py can call it directly (no self-HTTP-call, and
     no second copy of this logic to keep in sync)."""
     if config.ENABLE_QUERY_REWRITE and not req.skip_rewrite:
         queries, applied = await split_query(req.query)
+        if not applied and fallback_query is not None:
+            queries = [fallback_query]
     else:
-        queries, applied = [req.query], False
+        queries, applied = [fallback_query or req.query], False
 
     # Each sub-query runs the full embed/search/expand/rerank pipeline
     # independently (and concurrently) -- see run_single_query_pipeline --
