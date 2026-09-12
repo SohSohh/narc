@@ -1,7 +1,5 @@
-@import url("https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Instrument+Serif:ital@0;1&family=Manrope:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
-
 :root {
-  font-family: "Manrope", "Segoe UI", sans-serif;
+  font-family: "Segoe UI", sans-serif;
   color: #101012;
   background: #f3f1eb;
   font-synthesis: none;

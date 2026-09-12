@@ -1,16 +1,17 @@
-# React + Vite
+# NARC frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+A responsive NUST assistant built with React and Vite.
 
-Currently, two official plugins are available:
+## Development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Run `npm ci`, then `npm run dev`. Copy `.env.example` to `.env.local` to override `VITE_API_URL`. This public build-time value must be an HTTP(S) backend base URL; never place secrets in VITE variables. The hosted backend is the default.
 
-## React Compiler
+## Production
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+Run `npm run lint`, `node --test tests/chat.test.mjs`, and `npm run build`. Deploy `dist/` to a static HTTPS host. `npm run preview` is for local build inspection. Configure the backend to allow the deployed origin through CORS. Set your host?s security headers and cache hashed assets immutably; revalidate index.html on each visit.
 
-## Expanding the Oxlint configuration
+The API contract is POST /chat with { message, session_id }, returning { answer, session_id, sources }. New conversation clears local state, cancels pending requests and attempts DELETE /chat/{session_id}. Requests time out after 60 seconds and failed questions can be retried. Conversations remain in memory only.
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+Animations use CSS, finish automatically except for the pending indicator, and respect reduced motion. Markdown loads on demand. Typography uses system fonts with no third-party font requests.
+
+Before release, verify live backend connectivity and CORS from the deployed origin. Test keyboard navigation, mobile keyboards, source links, retries and new conversation during a pending request.

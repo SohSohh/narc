@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import "./App.css";
 
-const DEFAULT_BACKEND_URL =
-  "https://rag-backend.orangeglacier-b4beb8b5.uaenorth.azurecontainerapps.io";
+const Markdown = lazy(() => import("./Markdown.jsx"));
+
+const BACKEND_URL = (import.meta.env.VITE_API_URL ||
+  "https://rag-backend.orangeglacier-b4beb8b5.uaenorth.azurecontainerapps.io").replace(/\/$/, "");
 
 const STARTERS = [
   {
@@ -45,13 +45,7 @@ function Icon({ name, size = 18 }) {
       </svg>
     );
   }
-  if (name === "settings") {
-    return (
-      <svg {...props}>
-        <path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 5v4M6 15v4" />
-      </svg>
-    );
-  }
+
   if (name === "arrow") {
     return (
       <svg {...props}>
@@ -116,62 +110,56 @@ function Icon({ name, size = 18 }) {
   return null;
 }
 
-function formatTimer(seconds) {
-  if (!seconds || seconds <= 0) return "memory idle";
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes >= 60) return `${Math.floor(minutes / 60)}h memory`;
-  return `${minutes}m memory`;
+function safeSourceUrl(raw) {
+  try {
+    const url = new URL(raw);
+    return ["https:", "http:"].includes(url.protocol) ? url.href : undefined;
+  } catch { return undefined; }
 }
 
 function sourceName(source) {
-  if (source?.title) return source.title;
+  if (typeof source?.title === "string") return source.title;
   const raw = source?.source_url || source?.url;
   if (!raw) return "NUST source";
   try {
     return new URL(raw).hostname.replace(/^www\./, "");
   } catch {
-    return raw;
+    return typeof raw === "string" ? raw : "NUST source";
   }
 }
 
-function matchLabel(score) {
-  if (score == null || Number.isNaN(Number(score))) return null;
-  const number = Number(score);
-  const percentage = Math.round(Math.max(0, Math.min(1, number)) * 100);
-  return `${percentage}% match`;
-}
+
 
 export default function App() {
-  const [backendUrl, setBackendUrl] = useState(DEFAULT_BACKEND_URL);
   const [sessionId, setSessionId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [expandedSources, setExpandedSources] = useState({});
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState(null);
-  const [expiresIn, setExpiresIn] = useState(0);
+  const [failedMessage, setFailedMessage] = useState(null);
+  const [notice, setNotice] = useState("");
+  const requestRef = useRef(null);
+  const copyTimerRef = useRef(null);
+  const followScrollRef = useRef(true);
   const scrollRef = useRef(null);
   const textareaRef = useRef(null);
 
   const hasMessages = messages.length > 0;
-  const memoryLabel = useMemo(() => formatTimer(expiresIn), [expiresIn]);
+
+
+  useEffect(() => () => {
+    requestRef.current?.abort();
+    window.clearTimeout(copyTimerRef.current);
+  }, []);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({
+    if (followScrollRef.current) scrollRef.current?.scrollTo({
       top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
+      behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "instant" : "smooth",
     });
   }, [messages, loading]);
-
-  useEffect(() => {
-    if (!expiresIn) return undefined;
-    const timer = window.setInterval(() => {
-      setExpiresIn((current) => Math.max(0, current - 1));
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [Boolean(expiresIn)]);
 
   useEffect(() => {
     if (!textareaRef.current) return;
@@ -179,74 +167,72 @@ export default function App() {
     textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 156)}px`;
   }, [input]);
 
-  async function sendMessage(overrideText) {
+  async function sendMessage(overrideText, retry = false) {
     const text = (typeof overrideText === "string" ? overrideText : input).trim();
-    if (!text || loading) return;
-
-    const targetUrl = (backendUrl || DEFAULT_BACKEND_URL).trim();
-
+    if (!text || requestRef.current || text.length > 8000) return;
+    const controller = new AbortController();
+    requestRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort("timeout"), 60000);
+    followScrollRef.current = true;
     setError(null);
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    setFailedMessage(null);
+    if (!retry) setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
     setLoading(true);
-
     try {
-      const response = await fetch(`${targetUrl.replace(/\/$/, "")}/chat`, {
+      const response = await fetch(`${BACKEND_URL}/chat`, {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, session_id: sessionId }),
       });
-
-      const payload = await response.json().catch(() => null);
-
-      if (!response.ok) {
-        const messageText =
-          payload?.detail ||
-          payload?.error ||
-          payload?.message ||
-          (typeof payload === "string" ? payload : "");
-        throw new Error(
-          `${response.status} ${response.statusText}${
-            messageText ? ` — ${String(messageText).slice(0, 300)}` : ""
-          }`
-        );
+      if (!response.ok) throw new Error(response.status === 429
+        ? "Too many requests. Please wait a moment and try again."
+        : "We couldn?t get an answer right now. Please try again.");
+      const payload = await response.json();
+      if (typeof payload?.answer !== "string" || !payload.answer.trim()) {
+        throw new Error("The answer was incomplete. Please try again.");
       }
-
-      if (!payload || typeof payload !== "object") {
-        throw new Error("The backend returned an invalid response.");
-      }
-
-      setSessionId(payload.session_id ?? sessionId);
-      setExpiresIn(Number(payload.expires_in_seconds) || 0);
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: payload.answer || "",
-          sources: Array.isArray(payload.sources) ? payload.sources : [],
-        },
-      ]);
+      if (requestRef.current !== controller) return;
+      setNotice("Answer ready.");
+      setSessionId(typeof payload.session_id === "string" ? payload.session_id : sessionId);
+      setMessages((prev) => [...prev, {
+        role: "assistant", content: payload.answer,
+        sources: Array.isArray(payload.sources) ? payload.sources.filter((source) => source && typeof source === "object") : [],
+      }]);
     } catch (event) {
-      setError(event?.message || "Request failed");
+      if (requestRef.current !== controller) return;
+      setFailedMessage(text);
+      setError(controller.signal.reason === "timeout"
+        ? "This is taking longer than expected. Please try again."
+        : event instanceof TypeError ? "Couldn?t connect. Check your connection and try again."
+        : event?.message || "Something went wrong. Please try again.");
     } finally {
-      setLoading(false);
+      window.clearTimeout(timeout);
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        setLoading(false);
+      }
     }
   }
 
   function resetSession() {
     const oldSession = sessionId;
-    const targetUrl = (backendUrl || DEFAULT_BACKEND_URL).trim();
-
+    requestRef.current?.abort();
+    requestRef.current = null;
+    window.clearTimeout(copyTimerRef.current);
+    setLoading(false);
     setSessionId(null);
     setMessages([]);
     setInput("");
     setError(null);
+    setFailedMessage(null);
     setExpandedSources({});
-    setExpiresIn(0);
     setCopiedIndex(null);
-
+    setNotice("");
+    textareaRef.current?.focus();
     if (oldSession) {
-      fetch(`${targetUrl.replace(/\/$/, "")}/chat/${encodeURIComponent(oldSession)}`, {
+      fetch(`${BACKEND_URL}/chat/${encodeURIComponent(oldSession)}`, {
         method: "DELETE",
       }).catch(() => {});
     }
@@ -260,18 +246,18 @@ export default function App() {
     try {
       await navigator.clipboard.writeText(text);
       setCopiedIndex(index);
-      window.setTimeout(() => setCopiedIndex(null), 1400);
+      setNotice("Answer copied.");
+      window.clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = window.setTimeout(() => setCopiedIndex(null), 1800);
     } catch {
-      // Clipboard can be blocked in some embedded browsers; failing silently
-      // keeps the chat flow uninterrupted.
+      setNotice("Couldn?t copy. Select the answer to copy it manually.");
     }
   }
 
   return (
     <div className="site-frame">
-      <div className="ambient ambient-one" />
-      <div className="ambient ambient-two" />
-      <div className="noise" />
+      <a className="skip-link" href="#question">Skip to question</a>
+      <div className="sr-only" role="status">{loading ? "Searching NUST sources." : notice}</div>
 
       <aside className="side-rail">
         <div className="brand-lockup">
@@ -290,37 +276,18 @@ export default function App() {
           <Icon name="plus" size={17} />
         </button>
 
-        <div className="rail-section">
-          <div className="rail-kicker">Try asking</div>
-          <div className="rail-prompts">
-            {STARTERS.slice(0, 3).map((starter) => (
-              <button
-                key={starter.prompt}
-                className="rail-prompt"
-                type="button"
-                onClick={() => sendMessage(starter.prompt)}
-                disabled={loading}
-              >
-                <span>{starter.eyebrow}</span>
-                <p>{starter.prompt}</p>
-              </button>
-            ))}
-          </div>
-        </div>
+        <div className="rail-note"><span className="rail-kicker">A little less searching.</span><p>A little more<br />clarity.</p></div>
 
         <div className="rail-bottom">
           <div className="status-card">
             <div className="status-line">
               <span className="status-dot" />
-              <span>Knowledge engine</span>
-              <strong>live</strong>
+              <span>Made for NUST</span>
+
             </div>
             <p>Answers are grounded in the NUST knowledge base.</p>
           </div>
-          <button className="rail-settings" type="button" onClick={() => setSettingsOpen(true)}>
-            <Icon name="settings" size={16} />
-            Connection settings
-          </button>
+
         </div>
       </aside>
 
@@ -331,34 +298,19 @@ export default function App() {
             <button type="button" className="icon-button" onClick={resetSession} aria-label="New chat">
               <Icon name="plus" size={18} />
             </button>
-            <button
-              type="button"
-              className="icon-button"
-              onClick={() => setSettingsOpen(true)}
-              aria-label="Connection settings"
-            >
-              <Icon name="settings" size={18} />
-            </button>
+
           </div>
         </header>
 
         <div className="conversation-topline">
           <div className="topline-left">
             <span className="eyebrow">NUST / ASK ANYTHING</span>
-            {sessionId && (
-              <span className="memory-chip">
-                <span className="memory-pulse" />
-                {memoryLabel}
-              </span>
-            )}
+
           </div>
-          <button className="desktop-settings" type="button" onClick={() => setSettingsOpen(true)}>
-            <Icon name="settings" size={15} />
-            Configure
-          </button>
+          <span className="topline-caption">Your campus companion</span>
         </div>
 
-        <main ref={scrollRef} className={`message-panel ${hasMessages ? "has-messages" : "is-empty"}`}>
+        <main aria-label="Conversation" onScroll={() => { const panel = scrollRef.current; followScrollRef.current = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 100; }} ref={scrollRef} className={`message-panel ${hasMessages ? "has-messages" : "is-empty"}`}>
           {!hasMessages && (
             <section className="hero-state">
               <div className="hero-orbit" aria-hidden="true">
@@ -370,7 +322,7 @@ export default function App() {
               </div>
 
               <div className="hero-copy">
-                <span className="hero-kicker">YOUR CAMPUS, IN CONVERSATION</span>
+                <span className="hero-kicker">WELCOME TO NARC</span>
                 <h1>
                   Ask NUST.<br />
                   <em>Skip the maze.</em>
@@ -417,13 +369,13 @@ export default function App() {
               <div className={`message-wrap ${message.role}`}>
                 <div className="message-meta">
                   <span>{message.role === "user" ? "You" : "narc"}</span>
-                  {message.role === "assistant" && <span className="answer-state">grounded response</span>}
+
                 </div>
 
                 <div className={`message-bubble ${message.role === "user" ? "user-bubble" : "assistant-bubble"}`}>
                   {message.role === "assistant" ? (
                     <div className="message-content markdown-content">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                      <Suspense fallback={<div className="plain-answer">{message.content}</div>}><Markdown>{message.content}</Markdown></Suspense>
                     </div>
                   ) : (
                     <div className="message-content">{message.content}</div>
@@ -441,6 +393,8 @@ export default function App() {
                       <button
                         type="button"
                         className={expandedSources[index] ? "is-open" : ""}
+                        aria-expanded={Boolean(expandedSources[index])}
+                        aria-controls={`sources-${index}`}
                         onClick={() => toggleSources(index)}
                       >
                         <Icon name="link" size={14} />
@@ -452,15 +406,14 @@ export default function App() {
                 )}
 
                 {message.role === "assistant" && message.sources?.length > 0 && expandedSources[index] && (
-                  <div className="source-drawer">
+                  <div className="source-drawer" id={`sources-${index}`}>
                     <div className="source-drawer-head">
                       <span>Retrieved references</span>
                       <span>{String(message.sources.length).padStart(2, "0")}</span>
                     </div>
                     <div className="source-grid">
                       {message.sources.map((source, sourceIndex) => {
-                        const href = source.source_url || source.url;
-                        const score = matchLabel(source.rerank_score);
+                        const href = safeSourceUrl(source.source_url || source.url);
                         const CardTag = href ? "a" : "div";
                         return (
                           <CardTag
@@ -474,8 +427,7 @@ export default function App() {
                             </div>
                             <strong>{sourceName(source)}</strong>
                             <div className="source-card-bottom">
-                              <span>{source.breadcrumb || "NUST knowledge base"}</span>
-                              {score && <em>{score}</em>}
+                              <span>{typeof source.breadcrumb === "string" ? source.breadcrumb : "NUST knowledge base"}</span>
                             </div>
                           </CardTag>
                         );
@@ -515,6 +467,7 @@ export default function App() {
           <div className="error-banner" role="alert">
             <span>Request interrupted</span>
             <p>{error}</p>
+            {failedMessage && <button className="retry-button" type="button" disabled={loading} onClick={() => sendMessage(failedMessage, true)}>Try again</button>}
             <button type="button" onClick={() => setError(null)} aria-label="Dismiss error">
               <Icon name="close" size={16} />
             </button>
@@ -524,12 +477,14 @@ export default function App() {
         <footer className="composer-zone">
           <div className="composer-shell">
             <textarea
+              id="question"
+              maxLength={8000}
               ref={textareaRef}
               rows={1}
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
+                if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
                   event.preventDefault();
                   sendMessage();
                 }
@@ -554,55 +509,11 @@ export default function App() {
           </div>
           <div className="composer-footnote">
             <span>AI can misread ambiguous policies. Verify critical decisions with the linked source.</span>
-            <span>narc / 01</span>
+
           </div>
         </footer>
       </section>
 
-      {settingsOpen && (
-        <div className="settings-backdrop" role="presentation" onMouseDown={() => setSettingsOpen(false)}>
-          <aside className="settings-panel" onMouseDown={(event) => event.stopPropagation()}>
-            <div className="settings-heading">
-              <div>
-                <span className="settings-kicker">DEVELOPER / CONNECTION</span>
-                <h2>Chat endpoint</h2>
-              </div>
-              <button type="button" onClick={() => setSettingsOpen(false)} aria-label="Close settings">
-                <Icon name="close" size={18} />
-              </button>
-            </div>
-
-            <p className="settings-copy">
-              Keep this tucked away in production, but it is useful while you move between local,
-              staging and hosted backends.
-            </p>
-
-            <label className="settings-field">
-              <span>Backend base URL</span>
-              <input
-                type="url"
-                value={backendUrl}
-                onChange={(event) => setBackendUrl(event.target.value)}
-                placeholder="https://api.example.com"
-              />
-            </label>
-
-            <div className="settings-session">
-              <span>Active session</span>
-              <code>{sessionId || "No active session yet"}</code>
-            </div>
-
-            <div className="settings-actions">
-              <button type="button" className="reset-url" onClick={() => setBackendUrl(DEFAULT_BACKEND_URL)}>
-                Restore default
-              </button>
-              <button type="button" className="done-button" onClick={() => setSettingsOpen(false)}>
-                Done
-              </button>
-            </div>
-          </aside>
-        </div>
-      )}
     </div>
   );
 }
